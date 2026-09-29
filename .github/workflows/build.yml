@@ -1,0 +1,191 @@
+name: Build KernelSU kernel for RMX3366 (ColorOS 12.1 / kernel 4.19.157)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: https://github.com/ermyltsor/android_kernel_realme_sm8250.git
+  KERNEL_BRANCH: rui3.0
+  DEFCONFIG: vendor/kona-perf_defconfig
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline-stock
+            ksu: "false"
+            ksu_ref: "none"
+          - name: ksu-v0.9.5
+            ksu: "true"
+            ksu_ref: "v0.9.5"
+          - name: ksu-v3.3.0
+            ksu: "true"
+            ksu_ref: "v3.3.0"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    name: ${{ matrix.name }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "== before =="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/graalvm /opt/google /usr/lib/jvm || true
+          sudo apt-get clean
+          echo "== after =="
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex libssl-dev libelf-dev \
+            zip unzip python3 cpio rsync wget git lz4 libncurses-dev file \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download ZyCromerZ Clang 10.0.1-20220724
+        run: |
+          wget -q -c https://github.com/ZyCromerZ/Clang/releases/download/10.0.1-20220724-release/Clang-10.0.1-20220724.tar.gz
+          mkdir -p "$HOME/clang-tools"
+          tar -xzf Clang-10.0.1-20220724.tar.gz -C "$HOME/clang-tools"
+          "$HOME/clang-tools/bin/clang" --version
+
+      - name: Clone kernel source (${{ env.KERNEL_BRANCH }})
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          cd kernel
+          echo "== HEAD =="; git log --oneline -1
+          echo "== Makefile =="; head -6 Makefile
+          echo "== defconfig exists =="; ls -la arch/arm64/configs/vendor/kona-perf_defconfig
+          echo "== device tree for 21615 =="; ls vendor-source/vendor/qcom/proprietary/devicetree-4.19/ | head -20
+
+      - name: Integrate KernelSU (${{ matrix.ksu_ref }})
+        if: matrix.ksu == 'true'
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" -o /tmp/setup_ksu.sh
+          bash /tmp/setup_ksu.sh "${{ matrix.ksu_ref }}"
+          echo "== KernelSU dir =="; ls KernelSU/kernel | head -20
+          echo "== drivers/Makefile tail =="; tail -3 drivers/Makefile
+          echo "== drivers/Kconfig kernelsu line =="; grep -n "kernelsu" drivers/Kconfig || true
+          echo "== symlink =="; ls -la drivers/kernelsu
+
+      - name: Enable required kernel configs
+        run: |
+          cd kernel
+          D="arch/arm64/configs/${{ env.DEFCONFIG }}"
+          sed -i '/^CONFIG_KPROBES=/d; /^# CONFIG_KPROBES/d' "$D"
+          sed -i '/^CONFIG_KSU=/d; /^# CONFIG_KSU/d' "$D"
+          {
+            echo ''
+            echo '# ---- KernelSU requirements (added by CI) ----'
+            echo 'CONFIG_KPROBES=y'
+          } >> "$D"
+          if [ "${{ matrix.ksu }}" = "true" ]; then
+            echo 'CONFIG_KSU=y' >> "$D"
+          fi
+          echo "== defconfig tail =="; tail -8 "$D"
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          export PATH="$HOME/clang-tools/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_BUILD_USER=android
+          export KBUILD_BUILD_HOST=android-build
+          export LLVM=1
+          make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 "${{ env.DEFCONFIG }}"
+          make O=out ARCH=arm64 olddefconfig
+          echo "=== critical config check ==="
+          grep -E "^CONFIG_(KPROBES|KSU|KALLSYMS|KALLSYMS_ALL|EXT4_FS|OVERLAY_FS|MODULES|SECURITY_SELINUX)=" out/.config || true
+          echo "=== localversion ==="
+          grep -E "^CONFIG_LOCALVERSION" out/.config || true
+          if [ "${{ matrix.ksu }}" = "true" ]; then
+            grep -q "^CONFIG_KSU=y" out/.config || { echo "FATAL: CONFIG_KSU is not enabled"; exit 1; }
+            grep -q "^CONFIG_KPROBES=y" out/.config || { echo "FATAL: CONFIG_KPROBES is not enabled"; exit 1; }
+          fi
+          grep -q "^CONFIG_KPROBES=y" out/.config || { echo "FATAL: CONFIG_KPROBES missing"; exit 1; }
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          export PATH="$HOME/clang-tools/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_BUILD_USER=android
+          export KBUILD_BUILD_HOST=android-build
+          export LLVM=1
+          set +e
+          make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 -j"$(nproc)" \
+               2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          echo "=== build exit code: $RC ==="
+          df -h /
+          if [ "$RC" -ne 0 ]; then
+            echo "=== BUILD FAILED: last 120 lines ==="
+            tail -120 build.log
+            echo "=== error lines ==="
+            grep -nE "error:|Error [0-9]|No rule to make|undefined reference" build.log | tail -60
+            exit "$RC"
+          fi
+
+      - name: Verify build output
+        run: |
+          cd kernel
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/dtb out/arch/arm64/boot/dtbo.img 2>&1 || true
+          file out/arch/arm64/boot/Image
+          echo "=== KERNEL VERSION STRING (must contain 4.19.157-perf+) ==="
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+          echo "=== localversion sanity ==="
+          if strings out/arch/arm64/boot/Image | grep -m1 -q "Linux version 4.19.157-perf+"; then
+            echo "OK: version string matches stock (4.19.157-perf+)"
+          else
+            echo "WARN: version string differs from stock"
+          fi
+          echo "=== KernelSU markers in Image ==="
+          strings out/arch/arm64/boot/Image | grep -i -m8 "kernelsu\|ksu_\|KernelSU" || echo "(no KernelSU strings found)"
+          echo "=== module count ==="
+          find out -name '*.ko' | wc -l
+          echo "=== sha256 ==="
+          sha256sum out/arch/arm64/boot/Image | tee Image.sha256
+
+      - name: Pack artifacts
+        if: success()
+        run: |
+          cd kernel
+          mkdir -p /tmp/artifacts
+          cp out/arch/arm64/boot/Image /tmp/artifacts/Image
+          cp out/arch/arm64/boot/dtb /tmp/artifacts/dtb 2>/dev/null || true
+          cp out/arch/arm64/boot/dtbo.img /tmp/artifacts/dtbo.img 2>/dev/null || true
+          cp out/System.map /tmp/artifacts/System.map 2>/dev/null || true
+          cp out/.config /tmp/artifacts/dotconfig.txt
+          cp Image.sha256 /tmp/artifacts/ 2>/dev/null || true
+          tar -czf /tmp/artifacts/modules.tar.gz $(find out -name '*.ko') 2>/dev/null || true
+          ls -lh /tmp/artifacts
+
+      - name: Upload kernel image artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-image
+          path: /tmp/artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-buildlog
+          path: kernel/build.log
+          if-no-files-found: ignore
+          retention-days: 14
