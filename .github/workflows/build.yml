@@ -22,31 +22,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Route A: SUSFS + Kona/ColorOS fix patch, selinux static-export check bypassed
-          #          by enabling KALLSYMS_ALL (ReSukiSU Kbuild skips the check then).
-          - name: resukisu-susfs-cos15
-            fixpatch: patches/kona_cos15_a15__susfs_fixed.patch
-            kallsyms_all: "y"
-            staticfix: "false"
-          # Route B: same, but for the OxygenOS-flavoured Kona fix patch
+          # Single, fully-verified route.
+          #   * SUSFS v2.3.0 generic patch  -> 9/10 hunks on fs/namespace.c
+          #   * kona_oos fix patch          -> the missing fs/namespace.c hunk
+          #                                    (cos15's variant additionally fires
+          #                                     two hunks that always fail here,
+          #                                     so oos is strictly cleaner)
+          #   * kona_realme fdinfo fix      -> the rejected fs/notify/fdinfo.c hunk
+          #   * KALLSYMS_ALL=y              -> same value the STOCK defconfig
+          #                                    already uses, and it makes ReSukiSU
+          #                                    skip tools/static_export_check.mk
           - name: resukisu-susfs-oos
             fixpatch: patches/kona_oos__susfs_fixed.patch
+            fdinfopatch: patches/kona_realme__susfs_fdinfo_fixed.patch
             kallsyms_all: "y"
-            staticfix: "false"
-          # Route C: classic "no-kprobe" route - KALLSYMS_ALL off, selinux statics
-          #          exported by hand so static_export_check.mk passes.
-          - name: resukisu-susfs-cos15-nostatic
-            fixpatch: patches/kona_cos15_a15__susfs_fixed.patch
-            kallsyms_all: "n"
-            staticfix: "true"
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     name: ${{ matrix.name }}
 
     steps:
       # ---------------------------------------------------------------- setup --
-      # NOTE: without an explicit checkout, $GITHUB_WORKSPACE is EMPTY and the
-      # patches/ directory does not exist. Do not remove this step.
+      # NOTE: without an explicit checkout $GITHUB_WORKSPACE is EMPTY and patches/
+      # does not exist.  Do not remove this step.
       - name: Checkout repository (provides patches/)
         uses: actions/checkout@v4
         with:
@@ -88,23 +85,20 @@ jobs:
         run: |
           git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           cd kernel
-          echo "== HEAD ==";            git log --oneline -1
-          echo "== version ==";         head -6 Makefile
-          echo "== defconfig ==";       ls -la "${{ env.DEFCONFIG_FILE }}"
-          echo "== stock kallsyms ==";  grep -nE '^CONFIG_KALLSYMS' "${{ env.DEFCONFIG_FILE }}" || echo "(none in defconfig)"
-          echo "== oplus guard cfg ==" ; grep -cE '^CONFIG_OPLUS_SECURE_GUARD|^CONFIG_OPLUS_MOUNT_BLOCK|^CONFIG_OPLUS_KEVENT_UPLOAD' "${{ env.DEFCONFIG_FILE }}" || true
+          echo "== HEAD ==";           git log --oneline -1
+          echo "== version ==";        head -6 Makefile
+          echo "== defconfig ==";      ls -la "${{ env.DEFCONFIG_FILE }}"
+          echo "== stock kallsyms =="; grep -nE '^CONFIG_KALLSYMS' "${{ env.DEFCONFIG_FILE }}" || echo "(none)"
 
       - name: Integrate ReSukiSU
         run: |
           cd kernel
           curl -LSs "$RESUKISU_SETUP" -o /tmp/setup_resukisu.sh
           bash /tmp/setup_resukisu.sh main
-          echo "== KernelSU dir =="
           ls KernelSU/kernel | head -20
-          echo "== symlink =="
           ls -la drivers/kernelsu
           echo "== hook choices in Kconfig =="
-          grep -nE "config KSU$|KSU_TRACEPOINT_HOOK|KSU_MANUAL_HOOK$|KSU_SUSFS$|depends on THREAD_INFO_IN_TASK" drivers/kernelsu/Kconfig
+          grep -nE "config KSU$|KSU_TRACEPOINT_HOOK|KSU_MANUAL_HOOK$|KSU_SUSFS$|THREAD_INFO_IN_TASK" drivers/kernelsu/Kconfig || true
           echo "== Kbuild hook wiring =="
           grep -nE "KALLSYMS_ALL|static_export_check|MANUAL_HOOK|CONFIG_KSU_SUSFS|Unsupported hook method|fs/susfs.c" drivers/kernelsu/Kbuild || true
 
@@ -117,35 +111,59 @@ jobs:
 
           cp "$PATCHES/susfs_patch_to_4.19.patch" ./
 
-          # ---- stage 1: generic SUSFS v2.3.0 patch for 4.19 (some .rej expected) --
+          # ---- stage 1: generic SUSFS v2.3.0 patch (fs/namespace.c + fdinfo.c reject
+          #                exactly one hunk each; both are repaired below) -----------
           set +e
-          patch -p1 --no-backup-if-mismatch < susfs_patch_to_4.19.patch \
-            > /tmp/diag/patch_main.log 2>&1
-          RC=$?
+          patch -p1 --no-backup-if-mismatch < susfs_patch_to_4.19.patch > /tmp/diag/patch_main.log 2>&1
+          echo "stage1 rc=$?"
           set -e
-          echo "stage1 rc=$RC (non-zero tolerated, fix patch comes next)"
-          tail -60 /tmp/diag/patch_main.log
+          tail -80 /tmp/diag/patch_main.log
           echo "=== rej after stage 1 ==="
-          find . -name '*.rej' | tee /tmp/diag/rej_stage1.txt
+          find . -name '*.rej' -printf '%p\n' | sort | tee /tmp/diag/rej_stage1.txt
 
-          # ---- stage 2: device-specific fix patch --------------------------------
+          # ---- stage 2: fs/namespace.c fix patch ---------------------------------
           if [ -n "${{ matrix.fixpatch }}" ]; then
             cp "${{ github.workspace }}/ci/${{ matrix.fixpatch }}" ./
             FIX="$(basename "${{ matrix.fixpatch }}")"
             set +e
             patch -p1 --no-backup-if-mismatch < "$FIX" > /tmp/diag/patch_fix.log 2>&1
-            RC=$?
+            echo "stage2 rc=$?"
             set -e
-            echo "stage2 rc=$RC"
-            tail -60 /tmp/diag/patch_fix.log
+            tail -40 /tmp/diag/patch_fix.log
           fi
-          echo "=== rej after stage 2 ==="
-          find . -name '*.rej' | tee /tmp/diag/rej_stage2.txt
 
-          # keep the rejected hunks around for offline analysis
+          # ---- stage 3: fs/notify/fdinfo.c fix patch ----------------------------
+          if [ -n "${{ matrix.fdinfopatch }}" ]; then
+            cp "${{ github.workspace }}/ci/${{ matrix.fdinfopatch }}" ./
+            FDP="$(basename "${{ matrix.fdinfopatch }}")"
+            set +e
+            patch -p1 --no-backup-if-mismatch < "$FDP" > /tmp/diag/patch_fdinfo.log 2>&1
+            echo "stage3 rc=$?"
+            set -e
+            tail -40 /tmp/diag/patch_fdinfo.log
+            echo "=== rej after stage 3 ==="
+            find . -name '*.rej' -printf '%p\n' | sort | tee /tmp/diag/rej_stage3.txt
+            if ! grep -q 'susfs_is_current_proc_umounted' fs/notify/fdinfo.c; then
+              echo "WARN: fdinfo SUS_MOUNT block is MISSING - SUS_MOUNT leak coverage is incomplete"
+              echo "missing" > /tmp/diag/fdinfo_status.txt
+            else
+              echo "OK: fdinfo SUS_MOUNT block present"
+              echo "present" > /tmp/diag/fdinfo_status.txt
+            fi
+          fi
+
+          # keep rejected hunks for offline analysis
           find . -name '*.rej' -exec cp --parents {} /tmp/diag/rej/ \; || true
 
-          # ---- stage 3: SUSFS inline hook call sites ----------------------------
+          # ---- stage 4: drop stale SUSFS v2.2.0 leftovers -----------------------
+          # the device fix patches still carry these two IDA allocations, but the
+          # v2.3.0 generic patch never references them -> -Wunused-variable noise.
+          B4=$(grep -c 'static DEFINE_IDA(susfs_mnt_' fs/namespace.c || true)
+          sed -i '/^static DEFINE_IDA(susfs_mnt_id_ida);$/d; /^static DEFINE_IDA(susfs_mnt_group_ida);$/d' fs/namespace.c
+          A4=$(grep -c 'static DEFINE_IDA(susfs_mnt_' fs/namespace.c || true)
+          echo "stale DEFINE_IDA lines: $B4 -> $A4"
+
+          # ---- stage 5: SUSFS inline hook call sites ----------------------------
           cp "$PATCHES/susfs_inline_hook_patches.sh" ./
           set +e
           bash susfs_inline_hook_patches.sh ./
@@ -158,69 +176,35 @@ jobs:
             printf "  %-32s %s\n" "$f" "$(grep -o 'ksu_handle' "$f" 2>/dev/null | wc -l)"
           done
           echo "=== inline_hook_check requirements ==="
+          fail=0
           for pair in "fs/exec.c:ksu_handle_execveat" "fs/open.c:ksu_handle_faccessat" \
                       "fs/read_write.c:ksu_handle_sys_read" "fs/stat.c:ksu_handle_stat" \
                       "kernel/reboot.c:ksu_handle_sys_reboot" "kernel/sys.c:ksu_handle_setresuid" \
                       "drivers/input/input.c:ksu_handle_input_handle_event"; do
             f="${pair%%:*}"; s="${pair##*:}"
-            if grep -q "$s" "$f" 2>/dev/null; then echo "OK   $s @ $f"; else echo "MISS $s @ $f"; fi
+            if grep -q "$s" "$f" 2>/dev/null; then echo "OK   $s @ $f"; else echo "MISS $s @ $f"; fail=1; fi
           done
           echo "=== incompatible legacy hooks (must be absent) ==="
           for pair in "fs/read_write.c:ksu_vfs_read_hook" "fs/read_write.c:ksu_init_rc_hook" \
                       "fs/exec.c:ksu_execveat_hook" "drivers/input/input.c:ksu_input_hook"; do
             f="${pair%%:*}"; s="${pair##*:}"
-            if grep -wq "$s" "$f" 2>/dev/null; then echo "BAD  $s @ $f"; else echo "OK   $s absent in $f"; fi
+            if grep -wq "$s" "$f" 2>/dev/null; then echo "BAD  $s @ $f"; fail=1; else echo "OK   $s absent in $f"; fi
           done
 
-          # drop .rej/.orig so they cannot disturb the build
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
 
-          # ---- hard checks: SUSFS core must exist --------------------------------
-          fail=0
+          # ---- hard checks -------------------------------------------------------
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ -f "$f" ]; then echo "OK   $f"; else echo "MISS $f"; fail=1; fi
           done
           grep -q 'susfs.o' fs/Makefile && echo "OK   fs/Makefile susfs.o" || { echo "MISS fs/Makefile susfs.o"; fail=1; }
-          grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c && echo "OK   fs/namespace.c" || echo "WARN fs/namespace.c not patched"
-          grep -q 'susfs_is_inode_sus_path' fs/namei.c && echo "OK   fs/namei.c" || echo "WARN fs/namei.c not patched"
-          grep -q 'susfs' kernel/sys.c && echo "OK   kernel/sys.c" || echo "WARN kernel/sys.c not patched"
-          if [ -f include/linux/susfs.h ]; then
-            grep -m1 'SUSFS_VERSION' include/linux/susfs.h || true
-          fi
-          [ "$fail" = "0" ] || { echo "FATAL: SUSFS core files missing"; exit 1; }
+          grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c && echo "OK   fs/namespace.c patched" || { echo "MISS fs/namespace.c"; fail=1; }
+          grep -q 'susfs_is_inode_sus_path' fs/namei.c && echo "OK   fs/namei.c patched" || echo "WARN fs/namei.c"
+          grep -q 'susfs' kernel/sys.c && echo "OK   kernel/sys.c patched" || echo "WARN kernel/sys.c"
+          grep -q 'susfs_is_current_proc_umounted' fs/notify/fdinfo.c && echo "OK   fs/notify/fdinfo.c SUS_MOUNT" || { echo "MISS fs/notify/fdinfo.c"; fail=1; }
+          grep -m1 'SUSFS_VERSION' include/linux/susfs.h || true
+          if [ "$fail" != "0" ]; then echo "FATAL: SUSFS integration incomplete"; exit 1; fi
           echo "SUSFS apply stage OK"
-
-      # ------------------------------------------------- no-kprobe static state --
-      # static_export_check.mk (included by ReSukiSU/Kbuild unless KALLSYMS_ALL=y)
-      # hard-errors when security/selinux/selinuxfs.c still declares these static.
-      - name: Export selinux statics (no-kprobe route)
-        if: matrix.staticfix == 'true'
-        run: |
-          set -x
-          cd kernel
-          F=security/selinux/selinuxfs.c
-          if [ -f "$F" ]; then
-            if grep -q 'static ssize_t (\*const write_op\[\])' "$F"; then
-              sed -i 's/static ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t)/ssize_t (*const write_op[])(struct file *, char *, size_t)/' "$F"
-            else
-              sed -i 's/static ssize_t (\*write_op\[\])(struct file \*, char \*, size_t)/ssize_t (*write_op[])(struct file *, char *, size_t)/' "$F"
-            fi
-            sed -i 's/^static const struct file_operations sel_handle_status_ops = {/const struct file_operations sel_handle_status_ops = {/' "$F"
-            sed -i 's/^static DEFINE_MUTEX(sel_mutex)/DEFINE_MUTEX(sel_mutex)/' "$F"
-            echo "== selinuxfs.c now =="
-            grep -nE 'write_op\[\]|sel_handle_status_ops|sel_mutex' "$F" | head
-          else
-            echo "no $F"
-          fi
-          for f in security/selinux/ss/status.c security/selinux/ss/services.c security/selinux/hooks.c; do
-            [ -f "$f" ] || continue
-            sed -i 's/^static struct page \*selinux_status_page/struct page *selinux_status_page/' "$f"
-            sed -i 's/^static DEFINE_MUTEX(selinux_status_lock)/DEFINE_MUTEX(selinux_status_lock)/' "$f"
-            sed -i 's/^static DEFINE_RWLOCK(policy_rwlock)/DEFINE_RWLOCK(policy_rwlock)/' "$f"
-            sed -i 's/^static struct security_operations selinux_ops/struct security_operations selinux_ops/' "$f"
-            echo "== $f checked =="
-          done
-          echo "static export step done"
 
       # ------------------------------------------------------------- defconfig --
       - name: Configure defconfig
@@ -251,8 +235,6 @@ jobs:
             echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
             echo 'CONFIG_KSU_SUSFS_SUS_MAP=y'
           } >> "$D"
-
-          # CONFIG_KSU_SUSFS depends on THREAD_INFO_IN_TASK
           if grep -q 'THREAD_INFO_IN_TASK' drivers/kernelsu/Kconfig; then
             echo 'CONFIG_THREAD_INFO_IN_TASK=y' >> "$D"
           fi
@@ -265,40 +247,36 @@ jobs:
           export PATH="$HOME/clang-tools/bin:$PATH"
           export CROSS_COMPILE=aarch64-linux-gnu-
           export LLVM=1
-          make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 "${{ env.DEFCONFIG }}" \
-               > /tmp/diag/defconfig.log 2>&1 || { tail -60 /tmp/diag/defconfig.log; exit 1; }
-          make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 olddefconfig \
-               >> /tmp/diag/defconfig.log 2>&1 || { tail -60 /tmp/diag/defconfig.log; exit 1; }
-          echo "=== resolved KSU / SUSFS config ==="
-          grep -E '^CONFIG_(KSU|THREAD_INFO_IN_TASK)|^CONFIG_KALLSYMS|^CONFIG_KPROBES' out/.config | sort
+          MK="make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1"
+          $MK "${{ env.DEFCONFIG }}" > /tmp/diag/defconfig.log 2>&1 || { tail -60 /tmp/diag/defconfig.log; exit 1; }
+          $MK olddefconfig >> /tmp/diag/defconfig.log 2>&1 || { tail -60 /tmp/diag/defconfig.log; exit 1; }
+          echo "=== resolved KSU / SUSFS / FANOTIFY config ==="
+          grep -E '^CONFIG_(KSU|THREAD_INFO_IN_TASK)|^CONFIG_KALLSYMS|^CONFIG_FANOTIFY|^CONFIG_INOTIFY_USER|^CONFIG_KPROBES' out/.config | sort
           echo "=== localversion ==="
           grep -E '^CONFIG_LOCALVERSION' out/.config || true
-          grep -q '^CONFIG_KSU=y' out/.config            || { echo "FATAL: CONFIG_KSU not enabled"; exit 1; }
-          grep -q '^CONFIG_KSU_SUSFS=y' out/.config      || { echo "FATAL: CONFIG_KSU_SUSFS not enabled (check THREAD_INFO_IN_TASK/64BIT)"; exit 1; }
+          grep -q '^CONFIG_KSU=y' out/.config                 || { echo "FATAL: CONFIG_KSU not enabled"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config           || { echo "FATAL: CONFIG_KSU_SUSFS not enabled"; exit 1; }
           grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' out/.config || { echo "FATAL: THREAD_INFO_IN_TASK not enabled"; exit 1; }
-          if [ "${{ matrix.kallsyms_all }}" = "y" ]; then
-            grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config || { echo "FATAL: KALLSYMS_ALL not enabled"; exit 1; }
-          fi
-          grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' out/.config && { echo "FATAL: tracepoint hook selected instead of SUSFS"; exit 1; }
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config && { echo "FATAL: manual hook also selected (conflicts with SUSFS)"; exit 1; }
+          grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' out/.config && { echo "FATAL: tracepoint hook chosen"; exit 1; }
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config && { echo "FATAL: manual hook also chosen"; exit 1; }
           echo "config OK"
 
       - name: Build kernel
         run: |
           cd kernel
           export PATH="$HOME/clang-tools/bin:$PATH"
-          CROSS_COMPILE=aarch64-linux-gnu-; export CROSS_COMPILE
+          export CROSS_COMPILE=aarch64-linux-gnu-
           export KBUILD_BUILD_USER=android
           export KBUILD_BUILD_HOST=android-build
           export LLVM=1
           set +e
           make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 -j"$(nproc)" \
-               2>&1 | tee build.log
+               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 -j"$(nproc)" 2>&1 | tee build.log
           RC=${PIPESTATUS[0]}
           echo "=== build exit code: $RC ==="
+          echo "=== warning count ==="
+          grep -c 'warning:' build.log || true
+          grep -n 'warning:' build.log | head -20 || true
           df -h /
           if [ "$RC" -ne 0 ]; then
             echo "=== last 150 lines ==="
@@ -308,7 +286,7 @@ jobs:
             exit "$RC"
           fi
 
-      # ------------------------------------------------------------- verify ----
+      # -------------------------------------------------------------- verify ----
       - name: Verify output
         if: success()
         run: |
@@ -326,6 +304,10 @@ jobs:
           echo "=== ReSukiSU / SUSFS markers in Image ==="
           for m in "ReSukiSU" "KernelSU" "ksu_" "/data/adb/ksud" "susfs" "SUSFS_VERSION"; do
             printf "  %-16s %s\n" "$m" "$(strings out/arch/arm64/boot/Image | grep -c "$m")"
+          done
+          echo "=== SUSFS symbols in System.map ==="
+          for s in susfs_init susfs_is_current_proc_umounted susfs_sus_kstat_spoof_inotify_fdinfo susfs_is_inode_sus_path; do
+            printf "  %-40s %s\n" "$s" "$(grep -c " $s$" out/System.map 2>/dev/null || echo 0)"
           done
           echo "=== .ko count ==="
           find out -name '*.ko' | wc -l
@@ -352,7 +334,7 @@ jobs:
           name: ${{ matrix.name }}-image
           path: /tmp/artifacts/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Upload diagnostics (always)
         if: always()
@@ -363,4 +345,4 @@ jobs:
             kernel/build.log
             /tmp/diag/**
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 30
