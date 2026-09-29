@@ -1,4 +1,4 @@
-name: Build KernelSU kernel for RMX3366 (ColorOS 12.1 / kernel 4.19.157)
+name: Build ReSukiSU (+SUSFS) kernel for RMX3366 ColorOS 12.1 / 4.19.157
 
 on:
   workflow_dispatch:
@@ -12,6 +12,7 @@ env:
   KERNEL_REPO: https://github.com/ermyltsor/android_kernel_realme_sm8250.git
   KERNEL_BRANCH: rui3.0
   DEFCONFIG: vendor/kona-perf_defconfig
+  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
 
 jobs:
   build:
@@ -19,37 +20,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: baseline-stock
-            ksu: "false"
-            ksu_ref: "none"
-          - name: ksu-v0.9.5
-            ksu: "true"
-            ksu_ref: "v0.9.5"
-          - name: ksu-v3.3.0
-            ksu: "true"
-            ksu_ref: "v3.3.0"
+          # --- Route A: SUSFS + Kona/ColorOS fix patches ---
+          - name: resukisu-susfs-cos15
+            mode: susfs
+            fixpatch: patches/kona_cos15_a15__susfs_fixed.patch
+          # --- Route B: SUSFS + Kona/OxygenOS fix patches ---
+          - name: resukisu-susfs-oos
+            mode: susfs
+            fixpatch: patches/kona_oos__susfs_fixed.patch
+          # --- Route C: fallback, no SUSFS (manual/syscall hook only) ---
+          - name: resukisu-manual
+            mode: manual
+            fixpatch: ""
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    timeout-minutes: 300
     name: ${{ matrix.name }}
 
     steps:
       - name: Free disk space
         run: |
-          echo "== before =="
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                       /usr/local/graalvm /opt/google /usr/lib/jvm || true
           sudo apt-get clean
-          echo "== after =="
           df -h /
 
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential bc bison flex libssl-dev libelf-dev \
-            zip unzip python3 cpio rsync wget git lz4 libncurses-dev file \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi
+            zip unzip python3 cpio rsync wget git lz4 libncurses-dev file patch
 
       - name: Download ZyCromerZ Clang 10.0.1-20220724
         run: |
@@ -58,71 +59,152 @@ jobs:
           tar -xzf Clang-10.0.1-20220724.tar.gz -C "$HOME/clang-tools"
           "$HOME/clang-tools/bin/clang" --version
 
-      - name: Clone kernel source (${{ env.KERNEL_BRANCH }})
+      - name: Clone kernel source
         run: |
           git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
           cd kernel
-          echo "== HEAD =="; git log --oneline -1
-          echo "== Makefile =="; head -6 Makefile
-          echo "== defconfig exists =="; ls -la arch/arm64/configs/vendor/kona-perf_defconfig
-          echo "== device tree for 21615 =="; ls vendor-source/vendor/qcom/proprietary/devicetree-4.19/ | head -20
+          git log --oneline -1
+          head -6 Makefile
+          ls -la arch/arm64/configs/vendor/kona-perf_defconfig
+          echo "== does drivers/ exist (non-GKI path)? =="
+          ls -d drivers common/drivers 2>/dev/null || true
 
-      - name: Integrate KernelSU (${{ matrix.ksu_ref }})
-        if: matrix.ksu == 'true'
+      - name: Integrate ReSukiSU
         run: |
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" -o /tmp/setup_ksu.sh
-          bash /tmp/setup_ksu.sh "${{ matrix.ksu_ref }}"
-          echo "== KernelSU dir =="; ls KernelSU/kernel | head -20
-          echo "== drivers/Makefile tail =="; tail -3 drivers/Makefile
-          echo "== drivers/Kconfig kernelsu line =="; grep -n "kernelsu" drivers/Kconfig || true
-          echo "== symlink =="; ls -la drivers/kernelsu
+          curl -LSs "$RESUKISU_SETUP" -o /tmp/setup_resukisu.sh
+          bash /tmp/setup_resukisu.sh
+          echo "== KernelSU dir =="
+          ls KernelSU/kernel | head -20
+          echo "== hook mode available in Kconfig =="
+          grep -nE "KSU_SUSFS|KSU_MANUAL_HOOK|config KSU$" drivers/kernelsu/Kconfig | head -30
+          echo "== symlink =="
+          ls -la drivers/kernelsu
 
-      - name: Enable required kernel configs
+      - name: Apply SUSFS patch stack
+        run: |
+          cd kernel
+          set -x
+          mkdir -p /tmp/diag
+
+          if [ "${{ matrix.mode }}" != "susfs" ]; then
+            echo "SKIP SUSFS (mode=${{ matrix.mode }})"
+            exit 0
+          fi
+
+          cp "$GITHUB_WORKSPACE/patches/susfs_patch_to_4.19.patch" ./
+
+          # ---- stage 1: generic SUSFS patch (expected to leave some .rej) ----
+          patch -p1 --no-backup-if-mismatch < susfs_patch_to_4.19.patch \
+            > /tmp/diag/patch_main.log 2>&1
+          echo "main patch rc=$? (non-zero is expected/tolerated)"
+          tail -40 /tmp/diag/patch_main.log
+          echo "=== .rej after stage 1 ==="
+          find . -name '*.rej' | tee /tmp/diag/rej_stage1.txt
+
+          # ---- stage 2: device-specific fix patch ----
+          if [ -n "${{ matrix.fixpatch }}" ]; then
+            cp "$GITHUB_WORKSPACE/${{ matrix.fixpatch }}" ./
+            FIXNAME="$(basename "${{ matrix.fixpatch }}")"
+            patch -p1 --no-backup-if-mismatch < "$FIXNAME" \
+              > /tmp/diag/patch_fix.log 2>&1
+            echo "fix patch rc=$?"
+            tail -40 /tmp/diag/patch_fix.log
+          fi
+          echo "=== .rej after stage 2 ==="
+          find . -name '*.rej' | tee /tmp/diag/rej_stage2.txt
+
+          # ---- stage 3: SUSFS inline hook call sites ----
+          cp "$GITHUB_WORKSPACE/patches/susfs_inline_hook_patches.sh" ./
+          bash susfs_inline_hook_patches.sh ./ || echo "inline hook script rc=$?"
+          echo "=== ksu hooks injected ==="
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c fs/namei.c \
+                   drivers/input/input.c kernel/reboot.c kernel/sys.c; do
+            printf "  %-26s %s\n" "$f" "$(grep -c 'CONFIG_KSU_SUSFS' "$f" 2>/dev/null || echo 0)"
+          done
+
+          # ---- cleanup .rej/.orig so they can't disturb the build ----
+          find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
+
+          # ---- hard checks: SUSFS core must be present ----
+          fail=0
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "$f" ]; then echo "OK   $f"; else echo "MISS $f"; fail=1; fi
+          done
+          grep -q 'susfs.o' fs/Makefile && echo "OK   fs/Makefile has susfs.o" || { echo "MISS fs/Makefile susfs.o"; fail=1; }
+          grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c && echo "OK   fs/namespace.c patched" || { echo "MISS fs/namespace.c"; fail=1; }
+          grep -q 'susfs_is_inode_sus_path' fs/namei.c && echo "OK   fs/namei.c patched" || { echo "MISS fs/namei.c"; fail=1; }
+          grep -q 'susfs' kernel/sys.c && echo "OK   kernel/sys.c patched" || { echo "MISS kernel/sys.c"; fail=1; }
+          if [ "$fail" != "0" ]; then echo "FATAL: SUSFS did not apply cleanly"; exit 1; fi
+          echo "SUSFS apply stage OK"
+
+      - name: Apply manual hook (fallback route)
+        if: matrix.mode == 'manual'
+        run: |
+          cd kernel
+          cp "$GITHUB_WORKSPACE/patches/syscall_hook_patches.sh" ./
+          bash syscall_hook_patches.sh ./ || echo "manual hook script rc=$?"
+          echo "=== hooks injected ==="
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c; do
+            printf "  %-26s %s\n" "$f" "$(grep -c 'CONFIG_KSU' "$f" 2>/dev/null || echo 0)"
+          done
+
+      - name: Configure defconfig
         run: |
           cd kernel
           D="arch/arm64/configs/${{ env.DEFCONFIG }}"
-          sed -i '/^CONFIG_KPROBES=/d; /^# CONFIG_KPROBES/d' "$D"
-          sed -i '/^CONFIG_KSU=/d; /^# CONFIG_KSU/d' "$D"
+          sed -i '/^CONFIG_KSU/d; /^# CONFIG_KSU/d; /^CONFIG_KPROBES=/d; /^# CONFIG_KPROBES/d' "$D"
           {
             echo ''
-            echo '# ---- KernelSU requirements (added by CI) ----'
-            echo 'CONFIG_KPROBES=y'
+            echo '# ---- ReSukiSU (added by CI) ----'
+            echo 'CONFIG_KSU=y'
           } >> "$D"
-          if [ "${{ matrix.ksu }}" = "true" ]; then
-            echo 'CONFIG_KSU=y' >> "$D"
-          fi
-          echo "== defconfig tail =="; tail -8 "$D"
 
-      - name: Configure kernel
+          if [ "${{ matrix.mode }}" = "susfs" ]; then
+            {
+              echo 'CONFIG_KSU_SUSFS=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_PATH=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+              echo 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+              echo 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+              echo 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+              echo 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
+              echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_MAP=y'
+            } >> "$D"
+          else
+            echo 'CONFIG_KSU_MANUAL_HOOK=y' >> "$D"
+          fi
+          echo "== defconfig tail =="
+          tail -16 "$D"
+
+      - name: Run defconfig
         run: |
           cd kernel
           export PATH="$HOME/clang-tools/bin:$PATH"
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KBUILD_BUILD_USER=android
-          export KBUILD_BUILD_HOST=android-build
           export LLVM=1
           make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 "${{ env.DEFCONFIG }}"
-          make O=out ARCH=arm64 olddefconfig
-          echo "=== critical config check ==="
-          grep -E "^CONFIG_(KPROBES|KSU|KALLSYMS|KALLSYMS_ALL|EXT4_FS|OVERLAY_FS|MODULES|SECURITY_SELINUX)=" out/.config || true
+               OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 "${{ env.DEFCONFIG }}" \
+               > /tmp/diag/defconfig.log 2>&1 || { tail -40 /tmp/diag/defconfig.log; exit 1; }
+          make O=out ARCH=arm64 olddefconfig >> /tmp/diag/defconfig.log 2>&1 || { tail -40 /tmp/diag/defconfig.log; exit 1; }
+          echo "=== resolved config ==="
+          grep -E '^CONFIG_(KSU|KSU_|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|OVERLAY_FS|MODULES|SECURITY_SELINUX)' out/.config | sort
           echo "=== localversion ==="
-          grep -E "^CONFIG_LOCALVERSION" out/.config || true
-          if [ "${{ matrix.ksu }}" = "true" ]; then
-            grep -q "^CONFIG_KSU=y" out/.config || { echo "FATAL: CONFIG_KSU is not enabled"; exit 1; }
-            grep -q "^CONFIG_KPROBES=y" out/.config || { echo "FATAL: CONFIG_KPROBES is not enabled"; exit 1; }
+          grep -E '^CONFIG_LOCALVERSION' out/.config || true
+          grep -q '^CONFIG_KSU=y' out/.config || { echo "FATAL: CONFIG_KSU not enabled"; exit 1; }
+          if [ "${{ matrix.mode }}" = "susfs" ]; then
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "FATAL: CONFIG_KSU_SUSFS not enabled"; exit 1; }
           fi
-          grep -q "^CONFIG_KPROBES=y" out/.config || { echo "FATAL: CONFIG_KPROBES missing"; exit 1; }
+          echo "config OK"
 
       - name: Build kernel
         run: |
           cd kernel
           export PATH="$HOME/clang-tools/bin:$PATH"
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
           export KBUILD_BUILD_USER=android
           export KBUILD_BUILD_HOST=android-build
-          export LLVM=1
           set +e
           make O=out ARCH=arm64 CC=clang AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
                OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 -j"$(nproc)" \
@@ -131,31 +213,29 @@ jobs:
           echo "=== build exit code: $RC ==="
           df -h /
           if [ "$RC" -ne 0 ]; then
-            echo "=== BUILD FAILED: last 120 lines ==="
-            tail -120 build.log
+            echo "=== last 150 lines ==="
+            tail -150 build.log
             echo "=== error lines ==="
-            grep -nE "error:|Error [0-9]|No rule to make|undefined reference" build.log | tail -60
+            grep -nE "error:|Error [0-9]|No rule to make|undefined reference" build.log | tail -80
             exit "$RC"
           fi
 
-      - name: Verify build output
+      - name: Verify output
+        if: success()
         run: |
           cd kernel
-          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/dtb out/arch/arm64/boot/dtbo.img 2>&1 || true
+          ls -lh out/arch/arm64/boot/Image 2>&1 || true
           file out/arch/arm64/boot/Image
-          echo "=== KERNEL VERSION STRING (must contain 4.19.157-perf+) ==="
+          echo "=== KERNEL VERSION STRING ==="
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
-          echo "=== localversion sanity ==="
-          if strings out/arch/arm64/boot/Image | grep -m1 -q "Linux version 4.19.157-perf+"; then
-            echo "OK: version string matches stock (4.19.157-perf+)"
-          else
-            echo "WARN: version string differs from stock"
-          fi
-          echo "=== KernelSU markers in Image ==="
-          strings out/arch/arm64/boot/Image | grep -i -m8 "kernelsu\|ksu_\|KernelSU" || echo "(no KernelSU strings found)"
-          echo "=== module count ==="
+          strings out/arch/arm64/boot/Image | grep -m1 -q "Linux version 4.19.157-perf+" \
+            && echo "OK: 4.19.157-perf+ preserved" || echo "WARN: version string differs"
+          echo "=== ReSukiSU / SUSFS markers in Image ==="
+          for m in "KernelSU" "ksu_" "/data/adb/ksud" "susfs" "SUSFS_VERSION"; do
+            printf "  %-16s %s\n" "$m" "$(strings out/arch/arm64/boot/Image | grep -c "$m")"
+          done
+          echo "=== .ko count ==="
           find out -name '*.ko' | wc -l
-          echo "=== sha256 ==="
           sha256sum out/arch/arm64/boot/Image | tee Image.sha256
 
       - name: Pack artifacts
@@ -172,7 +252,7 @@ jobs:
           tar -czf /tmp/artifacts/modules.tar.gz $(find out -name '*.ko') 2>/dev/null || true
           ls -lh /tmp/artifacts
 
-      - name: Upload kernel image artifact
+      - name: Upload kernel artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -181,11 +261,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build log (always)
+      - name: Upload diagnostics (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}-buildlog
-          path: kernel/build.log
+          name: ${{ matrix.name }}-diag
+          path: |
+            kernel/build.log
+            /tmp/diag/*
           if-no-files-found: ignore
           retention-days: 14
